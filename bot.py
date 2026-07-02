@@ -1,6 +1,7 @@
 import os
 import logging
-import sqlite3
+import psycopg2
+import psycopg2.extras
 from io import BytesIO
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
@@ -39,10 +40,10 @@ ADMIN_IDS = {
     int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()
 }
 
-# Where to store the SQLite database file. On Railway, attach a Volume and
-# point this at a path inside it (e.g. /data/bot_stats.db), otherwise the
-# database will be wiped on every redeploy.
-DB_PATH = os.environ.get("DB_PATH", "bot_stats.db")
+# Postgres connection string. On Railway, link the Postgres service to this
+# one (Variables -> New Variable -> reference ${{Postgres.DATABASE_URL}}),
+# or Railway will auto-provide DATABASE_URL if the services are linked.
+DATABASE_URL = os.environ["DATABASE_URL"]
 
 MAX_HISTORY_TURNS = 8  # how many past exchanges to keep per user
 
@@ -77,49 +78,47 @@ def trim_history(user_id: int) -> None:
         user_history[user_id] = hist[-MAX_HISTORY_TURNS * 2 :]
 
 
-# --- Database (usage logging) -------------------------------------------------
-def db_connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+# --- Database (usage logging, Postgres) ----------------------------------------
+def db_connect():
+    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
 
 
 def init_db() -> None:
     conn = db_connect()
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            username TEXT,
-            first_name TEXT,
-            kind TEXT NOT NULL DEFAULT 'text',
-            message_text TEXT,
-            created_at TEXT NOT NULL
+    with conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS messages (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                username TEXT,
+                first_name TEXT,
+                kind TEXT NOT NULL DEFAULT 'text',
+                message_text TEXT,
+                created_at TIMESTAMPTZ NOT NULL
+            )
+            """
         )
-        """
-    )
-    conn.commit()
     conn.close()
-    logger.info("Database ready at %s", DB_PATH)
+    logger.info("Database ready (Postgres)")
 
 
 def log_event(update: Update, kind: str, text: str | None) -> None:
     user = update.effective_user
     conn = db_connect()
-    conn.execute(
-        "INSERT INTO messages (user_id, username, first_name, kind, message_text, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (
-            user.id,
-            user.username,
-            user.first_name,
-            kind,
-            text,
-            datetime.now(timezone.utc).isoformat(),
-        ),
-    )
-    conn.commit()
+    with conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO messages (user_id, username, first_name, kind, message_text, created_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s)",
+            (
+                user.id,
+                user.username,
+                user.first_name,
+                kind,
+                text,
+                datetime.now(timezone.utc),
+            ),
+        )
     conn.close()
 
 
@@ -244,31 +243,37 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return  # silently ignore for non-admins
 
     conn = db_connect()
-    total_messages = conn.execute("SELECT COUNT(*) AS c FROM messages").fetchone()["c"]
-    total_users = conn.execute(
-        "SELECT COUNT(DISTINCT user_id) AS c FROM messages"
-    ).fetchone()["c"]
-
     since_today = datetime.now(timezone.utc).replace(
         hour=0, minute=0, second=0, microsecond=0
-    ).isoformat()
-    today_messages = conn.execute(
-        "SELECT COUNT(*) AS c FROM messages WHERE created_at >= ?", (since_today,)
-    ).fetchone()["c"]
-    today_users = conn.execute(
-        "SELECT COUNT(DISTINCT user_id) AS c FROM messages WHERE created_at >= ?",
-        (since_today,),
-    ).fetchone()["c"]
+    )
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) AS c FROM messages")
+        total_messages = cur.fetchone()["c"]
 
-    top_users = conn.execute(
-        """
-        SELECT user_id, username, first_name, COUNT(*) AS c
-        FROM messages
-        GROUP BY user_id
-        ORDER BY c DESC
-        LIMIT 5
-        """
-    ).fetchall()
+        cur.execute("SELECT COUNT(DISTINCT user_id) AS c FROM messages")
+        total_users = cur.fetchone()["c"]
+
+        cur.execute(
+            "SELECT COUNT(*) AS c FROM messages WHERE created_at >= %s", (since_today,)
+        )
+        today_messages = cur.fetchone()["c"]
+
+        cur.execute(
+            "SELECT COUNT(DISTINCT user_id) AS c FROM messages WHERE created_at >= %s",
+            (since_today,),
+        )
+        today_users = cur.fetchone()["c"]
+
+        cur.execute(
+            """
+            SELECT user_id, username, first_name, COUNT(*) AS c
+            FROM messages
+            GROUP BY user_id, username, first_name
+            ORDER BY c DESC
+            LIMIT 5
+            """
+        )
+        top_users = cur.fetchall()
     conn.close()
 
     lines = [
@@ -297,11 +302,13 @@ async def recent_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         limit = min(int(context.args[0]), 100)
 
     conn = db_connect()
-    rows = conn.execute(
-        "SELECT user_id, username, first_name, kind, message_text, created_at "
-        "FROM messages ORDER BY id DESC LIMIT ?",
-        (limit,),
-    ).fetchall()
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT user_id, username, first_name, kind, message_text, created_at "
+            "FROM messages ORDER BY id DESC LIMIT %s",
+            (limit,),
+        )
+        rows = cur.fetchall()
     conn.close()
 
     if not rows:
@@ -311,7 +318,7 @@ async def recent_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = [f"🕒 *Последние {len(rows)} сообщений:*", ""]
     for row in reversed(rows):
         name = row["username"] and f"@{row['username']}" or row["first_name"] or str(row["user_id"])
-        ts = row["created_at"][11:16]  # HH:MM
+        ts = row["created_at"].strftime("%H:%M")
         text = (row["message_text"] or "").replace("\n", " ")
         if len(text) > 80:
             text = text[:80] + "…"
