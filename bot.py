@@ -1,6 +1,8 @@
 import os
 import logging
+import sqlite3
 from io import BytesIO
+from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
 
 import requests
@@ -30,6 +32,17 @@ logger = logging.getLogger(__name__)
 # --- Config from environment -------------------------------------------------
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+
+# Your Telegram user ID(s) — only these people can use /stats and /recent.
+# Comma-separated if you want more than one admin, e.g. "123456,987654"
+ADMIN_IDS = {
+    int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()
+}
+
+# Where to store the SQLite database file. On Railway, attach a Volume and
+# point this at a path inside it (e.g. /data/bot_stats.db), otherwise the
+# database will be wiped on every redeploy.
+DB_PATH = os.environ.get("DB_PATH", "bot_stats.db")
 
 MAX_HISTORY_TURNS = 8  # how many past exchanges to keep per user
 
@@ -62,6 +75,56 @@ def trim_history(user_id: int) -> None:
     hist = user_history.get(user_id, [])
     if len(hist) > MAX_HISTORY_TURNS * 2:
         user_history[user_id] = hist[-MAX_HISTORY_TURNS * 2 :]
+
+
+# --- Database (usage logging) -------------------------------------------------
+def db_connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db() -> None:
+    conn = db_connect()
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            username TEXT,
+            first_name TEXT,
+            kind TEXT NOT NULL DEFAULT 'text',
+            message_text TEXT,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+    logger.info("Database ready at %s", DB_PATH)
+
+
+def log_event(update: Update, kind: str, text: str | None) -> None:
+    user = update.effective_user
+    conn = db_connect()
+    conn.execute(
+        "INSERT INTO messages (user_id, username, first_name, kind, message_text, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            user.id,
+            user.username,
+            user.first_name,
+            kind,
+            text,
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def is_admin(update: Update) -> bool:
+    return update.effective_user.id in ADMIN_IDS
 
 
 # --- AI call (Groq, free) -------------------------------------------------------
@@ -101,6 +164,7 @@ async def generate_image(prompt: str) -> bytes:
 
 # --- Handlers --------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log_event(update, "command", "/start")
     user_id = update.effective_user.id
     model_key = get_model_key(user_id)
     await update.message.reply_text(
@@ -116,6 +180,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log_event(update, "command", "/model")
     keyboard = [
         [
             InlineKeyboardButton("🧠 Умная (медленнее)", callback_data="set_model:smart"),
@@ -138,12 +203,14 @@ async def model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log_event(update, "command", "/reset")
     user_history.pop(update.effective_user.id, None)
     await update.message.reply_text("История диалога очищена.")
 
 
 async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prompt = " ".join(context.args)
+    log_event(update, "image", prompt or "/image (без описания)")
     if not prompt:
         await update.message.reply_text("Использование: /image описание картинки")
         return
@@ -159,6 +226,7 @@ async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text
+    log_event(update, "text", text)
 
     await update.message.chat.send_action(ChatAction.TYPING)
     try:
@@ -170,13 +238,104 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(answer)
 
 
+# --- Admin-only stats commands -------------------------------------------------
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return  # silently ignore for non-admins
+
+    conn = db_connect()
+    total_messages = conn.execute("SELECT COUNT(*) AS c FROM messages").fetchone()["c"]
+    total_users = conn.execute(
+        "SELECT COUNT(DISTINCT user_id) AS c FROM messages"
+    ).fetchone()["c"]
+
+    since_today = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ).isoformat()
+    today_messages = conn.execute(
+        "SELECT COUNT(*) AS c FROM messages WHERE created_at >= ?", (since_today,)
+    ).fetchone()["c"]
+    today_users = conn.execute(
+        "SELECT COUNT(DISTINCT user_id) AS c FROM messages WHERE created_at >= ?",
+        (since_today,),
+    ).fetchone()["c"]
+
+    top_users = conn.execute(
+        """
+        SELECT user_id, username, first_name, COUNT(*) AS c
+        FROM messages
+        GROUP BY user_id
+        ORDER BY c DESC
+        LIMIT 5
+        """
+    ).fetchall()
+    conn.close()
+
+    lines = [
+        "📊 *Статистика бота*",
+        "",
+        f"Всего пользователей: *{total_users}*",
+        f"Всего сообщений: *{total_messages}*",
+        "",
+        f"Сегодня: *{today_users}* польз. / *{today_messages}* сообщ.",
+        "",
+        "*Топ по активности:*",
+    ]
+    for row in top_users:
+        name = row["username"] and f"@{row['username']}" or row["first_name"] or str(row["user_id"])
+        lines.append(f"— {name}: {row['c']}")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def recent_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+
+    limit = 20
+    if context.args and context.args[0].isdigit():
+        limit = min(int(context.args[0]), 100)
+
+    conn = db_connect()
+    rows = conn.execute(
+        "SELECT user_id, username, first_name, kind, message_text, created_at "
+        "FROM messages ORDER BY id DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        await update.message.reply_text("Пока нет ни одного сообщения.")
+        return
+
+    lines = [f"🕒 *Последние {len(rows)} сообщений:*", ""]
+    for row in reversed(rows):
+        name = row["username"] and f"@{row['username']}" or row["first_name"] or str(row["user_id"])
+        ts = row["created_at"][11:16]  # HH:MM
+        text = (row["message_text"] or "").replace("\n", " ")
+        if len(text) > 80:
+            text = text[:80] + "…"
+        lines.append(f"`{ts}` *{name}*: {text}")
+
+    message = "\n".join(lines)
+    # Telegram messages are capped at 4096 chars
+    if len(message) > 4000:
+        message = message[:4000] + "\n…"
+
+    await update.message.reply_text(message, parse_mode="Markdown")
+
+
 def main():
+    init_db()
+
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("model", model_command))
     app.add_handler(CommandHandler("reset", reset_command))
     app.add_handler(CommandHandler("image", image_command))
+    app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("recent", recent_command))
     app.add_handler(CallbackQueryHandler(model_callback, pattern=r"^set_model:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
